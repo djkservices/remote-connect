@@ -300,7 +300,7 @@ struct ServerEditView: View {
                         Text(type.rawValue).tag(type)
                     }
                 }
-                .onChange(of: serverType) {
+                .onChange(of: serverType) { _ in
                     port = String(serverType.defaultPort)
                 }
 
