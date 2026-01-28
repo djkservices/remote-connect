@@ -221,22 +221,132 @@ class ServerManager: ObservableObject {
         errorMessage = nil
         statusMessage = "Connecting to SMB..."
 
+        // Use NetFS/open command approach which handles permissions properly
+        var smbURLString = "smb://"
+        if !server.domain.isEmpty {
+            smbURLString += "\(server.domain);"
+        }
+
+        let encodedUsername = server.username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? server.username
+        let encodedPassword = password.addingPercentEncoding(withAllowedCharacters: .urlPasswordAllowed) ?? password
+
+        smbURLString += "\(encodedUsername):\(encodedPassword)@\(server.host)"
+        if server.port != 445 {
+            smbURLString += ":\(server.port)"
+        }
+        smbURLString += "/\(server.shareName)"
+
+        // Use osascript to mount via Finder (handles permissions properly)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.performSMBConnect(server: server, password: password)
+            let script = """
+            tell application "Finder"
+                try
+                    mount volume "\(smbURLString)"
+                    return "OK"
+                on error errMsg
+                    return errMsg
+                end try
+            end tell
+            """
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", script]
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+
+                DispatchQueue.main.async {
+                    self?.isConnecting = false
+
+                    if output.contains("OK") || process.terminationStatus == 0 {
+                        // Find the mounted volume
+                        let volumePath = "/Volumes/\(server.shareName)"
+                        if FileManager.default.fileExists(atPath: volumePath) {
+                            self?.smbMountPoint = URL(fileURLWithPath: volumePath)
+                        } else {
+                            // Try to find it with a different name
+                            self?.findAndSetSMBMount(shareName: server.shareName)
+                        }
+
+                        self?.connectedServerID = server.id
+                        self?.currentPath = ""
+                        self?.navigationHistory = [""]
+                        self?.historyIndex = 0
+                        self?.statusMessage = "Connected to \(server.name)"
+
+                        if var s = self?.servers.first(where: { $0.id == server.id }) {
+                            s.lastConnected = Date()
+                            self?.updateServer(s, password: nil)
+                        }
+
+                        self?.loadFiles()
+                    } else {
+                        self?.errorMessage = "SMB connection failed: \(output)"
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.isConnecting = false
+                    self?.errorMessage = "SMB connection failed: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
-    private func performSMBConnect(server: Server, password: String) {
-        let volumesPath = "/Volumes/\(server.name.replacingOccurrences(of: " ", with: "_"))_\(server.shareName)"
+    private func findAndSetSMBMount(shareName: String) {
+        // Look for recently mounted volumes that match the share name
+        let volumesURL = URL(fileURLWithPath: "/Volumes")
+        if let contents = try? fileManager.contentsOfDirectory(at: volumesURL, includingPropertiesForKeys: nil) {
+            for url in contents {
+                if url.lastPathComponent.lowercased().contains(shareName.lowercased()) {
+                    smbMountPoint = url
+                    return
+                }
+            }
+            // If no match, use the most recently added volume
+            let sorted = contents.sorted { url1, url2 in
+                let date1 = (try? url1.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
+                let date2 = (try? url2.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
+                return date1 > date2
+            }
+            if let first = sorted.first, first.lastPathComponent != "Macintosh HD" {
+                smbMountPoint = first
+            }
+        }
+    }
+
+    private func performSMBConnect_legacy(server: Server, password: String) {
+        // Sanitize mount point name - remove special characters
+        let safeName = server.name
+            .replacingOccurrences(of: " ", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+        let safeShare = server.shareName
+            .replacingOccurrences(of: " ", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+
+        let volumesPath = "/Volumes/\(safeName)_\(safeShare)"
         let mountURL = URL(fileURLWithPath: volumesPath)
 
-        // Unmount if exists
+        // Unmount and remove if exists
         if fileManager.fileExists(atPath: volumesPath) {
             let unmount = Process()
             unmount.launchPath = "/usr/sbin/diskutil"
-            unmount.arguments = ["unmount", volumesPath]
+            unmount.arguments = ["unmount", "force", volumesPath]
             try? unmount.run()
             unmount.waitUntilExit()
+
+            // Remove directory if still exists
+            try? fileManager.removeItem(atPath: volumesPath)
         }
 
         // Build SMB URL
@@ -254,12 +364,21 @@ class ServerManager: ObservableObject {
         }
         smbURLString += "/\(server.shareName)"
 
+        // Create mount point directory
+        do {
+            try fileManager.createDirectory(atPath: volumesPath, withIntermediateDirectories: true, attributes: nil)
+        } catch {
+            DispatchQueue.main.async { [weak self] in
+                self?.isConnecting = false
+                self?.errorMessage = "Failed to create mount point: \(error.localizedDescription)"
+            }
+            return
+        }
+
         // Mount
         let mount = Process()
         mount.launchPath = "/sbin/mount_smbfs"
-        mount.arguments = [smbURLString, volumesPath]
-
-        try? fileManager.createDirectory(atPath: volumesPath, withIntermediateDirectories: true, attributes: nil)
+        mount.arguments = ["-o", "nobrowse", smbURLString, volumesPath]
 
         let pipe = Pipe()
         mount.standardError = pipe
