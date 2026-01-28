@@ -35,10 +35,11 @@ A unified macOS menu bar app for managing remote server connections - FTP, SMB, 
 - Upload support
 
 #### SMB (Windows Shares)
-- Native macOS mount via mount_smbfs
+- Native macOS mounting via Finder
 - Full file system access after mounting
 - Domain authentication support
 - Opens files with default applications
+- Automatic volume detection
 
 #### RDP (Remote Desktop)
 - Launches FreeRDP for remote desktop
